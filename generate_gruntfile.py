@@ -1,15 +1,16 @@
-p = app.Plone
+p = app.Plone  # noqa
 from zope.site.hooks import setSite
 setSite(p)
 
 from zope.site.hooks import getSite
 
 import os
+import uuid
 
 portal = getSite()
 
 import json
-
+from plone.subrequest import subrequest
 from Products.CMFPlone.interfaces import (
     IBundleRegistry,
     IResourceRegistry)
@@ -17,8 +18,8 @@ from zope.component import getUtility
 from plone.registry.interfaces import IRegistry
 
 registry = getUtility(IRegistry)
-bundles = registry.collectionOfInterface(IBundleRegistry, prefix="plone.bundles")
-resources = registry.collectionOfInterface(IResourceRegistry, prefix="plone.resources")
+bundles = registry.collectionOfInterface(IBundleRegistry, prefix="plone.bundles")  # noqa
+resources = registry.collectionOfInterface(IResourceRegistry, prefix="plone.resources")  # noqa
 lessvariables = registry.records['plone.lessvariables'].value
 
 gruntfile_template = """
@@ -35,10 +36,13 @@ module.exports = function(grunt) {{
         sed: {{
             {sed}
         }},
+        uglify: {{
+            {uglify}
+        }},
         watch: {{
             scripts: {{
                 files: {files},
-                tasks: ['requirejs', 'less', 'sed']
+                tasks: ['requirejs', 'less', 'sed', 'uglify']
             }}
         }}
     }});
@@ -46,10 +50,11 @@ module.exports = function(grunt) {{
     grunt.loadNpmTasks('grunt-contrib-watch');
     grunt.loadNpmTasks('grunt-contrib-requirejs');
     grunt.loadNpmTasks('grunt-contrib-less');
+    grunt.loadNpmTasks('grunt-contrib-uglify');
     grunt.loadNpmTasks('grunt-sed');
 
     grunt.registerTask('default', ['watch']);
-    grunt.registerTask('compile', ['requirejs', 'less', 'sed']);
+    grunt.registerTask('compile', ['requirejs', 'less', 'sed', 'uglify']);
 }}
 """
 
@@ -72,10 +77,21 @@ requirejs_config = """
                     wrapShim: true,
                     name: '{name}',
                     out: '{out}',
-                    optimize: "uglify",
-                    exclude: ['jquery']
+                    optimize: "none"
                 }}
             }},
+"""
+uglify_config = """
+        {bkey}: {{
+          options: {{
+            sourceMap: true,
+            sourceMapName: '{src}.min.js.map',
+            sourceMapIncludeSources: false
+          }},
+          files: {{
+            '{src}.min.js': ['{src}.js']
+          }}
+        }},
 """
 
 less_config = """
@@ -85,20 +101,20 @@ less_config = """
                     strictMath: false,
                     sourceMap: true,
                     outputSourceFiles: true,
+                    strctImports: true,
                     relativeUrls: true,
+                    plugins: [
+                        new require('less-plugin-inline-urls'),
+                    ],
                     modifyVars: {{
                       {globalVars}
                     }}
                 }},
                 files: {{
-                    {files}                  
+                    {files}
                 }}
             }}
 """
-
-less_trick = ".."
-for i in range(20):
-    less_trick += "/.."
 
 
 from plone.resource.file import FilesystemFile
@@ -107,8 +123,10 @@ from Products.Five.browser.resource import DirectoryResource
 from plone.resource.directory import FilesystemResourceDirectory
 from Products.CMFCore.FSFile import FSFile
 
+temp_resource_folder = 'temp_resources'
 
-def resource_to_dir(resource):
+
+def resource_to_dir(resource, file_type='.js'):
     if resource.__module__ == 'Products.Five.metaclass':
         try:
             return resource.chooseContext().path
@@ -116,7 +134,25 @@ def resource_to_dir(resource):
             try:
                 return resource.context.path
             except:
-                return None
+                try:
+                    if callable(resource):
+                        file_name = uuid.uuid4().hex
+                        try:
+                            os.mkdir(temp_resource_folder)
+                        except OSError:
+                            pass
+                        full_file_name = temp_resource_folder + '/' + file_name + file_type
+                        temp_file = open(full_file_name, 'w')
+                        temp_file.write(resource().encode('utf-8'))
+                        temp_file.close()
+
+                        return os.getcwd() + '/' + full_file_name
+                    else:
+                        print "Missing resource type"
+                        return None
+                except:
+                    print "Missing resource type"
+                    return None
     elif isinstance(resource, FilesystemFile):
         return resource.path
     elif isinstance(resource, FileResource):
@@ -139,27 +175,44 @@ for requirejs, script in resources.items():
     if script.js:
         # Main resource js file
         resource_file = portal.unrestrictedTraverse(script.js, None)
+        src = None
         if resource_file:
-            src = resource_to_dir(resource_file)
-            if src:
-                # Extract .js
-                paths[requirejs] = src[:-3]
-                exports = script.export
-                deps = script.deps
-                inits = script.init
-                if exports != '' or deps != '' or inits != '':
-                    shims[requirejs] = {}
-                    if exports != '' and exports is not None:
-                        shims[requirejs]['exports'] = exports
-                    if deps != '' and deps is not None:
-                        shims[requirejs]['deps'] = deps.split(',')
-                    if inits != '' and inits is not None:
-                        shims[requirejs]['init'] = inits
+            local_file = resource_to_dir(resource_file)
+        else:
+            # In case is not found on traverse we dump it from request to file
+            response = subrequest(portal.absolute_url() + '/' + script.js)
+            local_file = None
+            if response.status == 200:
+                js_body = response.getBody()
+                file_name = uuid.uuid4().hex
+                try:
+                    os.mkdir(temp_resource_folder)
+                except OSError:
+                    pass
+                local_file = temp_resource_folder + '/' + file_name + '.js'
+                temp_file = open(local_file, 'w')
+                temp_file.write(js_body.encode('utf-8'))
+                temp_file.close()
+
+        if local_file:
+            # Extract .js
+            paths[requirejs] = local_file[:-3]
+            exports = script.export
+            deps = script.deps
+            inits = script.init
+            if exports != '' or deps != '' or inits != '':
+                shims[requirejs] = {}
+                if exports != '' and exports is not None:
+                    shims[requirejs]['exports'] = exports
+                if deps != '' and deps is not None:
+                    shims[requirejs]['deps'] = deps.split(',')
+                if inits != '' and inits is not None:
+                    shims[requirejs]['init'] = inits
         else:
             print "No file found: " + script.js
     if script.url:
         # Resources available under name-url name
-        paths[requirejs + '-url'] = resource_to_dir(portal.unrestrictedTraverse(script.url))
+        paths[requirejs + '-url'] = resource_to_dir(portal.unrestrictedTraverse(script.url))  # noqa
 
 
 # LESS CONFIGURATION
@@ -180,13 +233,13 @@ for name, value in lessvariables.items():
 for name, value in lessvariables.items():
     t = value.format(**less_vars_params)
     if 'LOCAL' in t:
-        t_object = portal.unrestrictedTraverse(str(t.replace('LOCAL/', '').replace('\\"', '')), None)
+        t_object = portal.unrestrictedTraverse(str(t.replace('LOCAL/', '').replace('\\"', '')), None)  # noqa
         if t_object:
             t_file = resource_to_dir(t_object)
-            t_file = t_file.replace(os.getcwd() + '/','')
+            t_file = t_file.replace(os.getcwd() + '/', '')
             globalVars[name] = "'%s/'" % t_file
         else:
-            print "No file found: " + str(t.replace('LOCAL/', '').replace('\\"', ''))
+            print "No file found: " + str(t.replace('LOCAL/', '').replace('\\"', ''))  # noqa
     else:
         globalVars[name] = t
 
@@ -200,10 +253,33 @@ for name, value in resources.items():
     for css in value.css:
         # less vars can't have dots on it
         local_src = portal.unrestrictedTraverse(css, None)
+        extension = css.split('.')[-1]
         if local_src:
-            local_file = resource_to_dir(local_src)
-            less_directories[css.rsplit('/', 1)[0]] = local_file.rsplit('/', 1)[0].replace(os.getcwd() + '/', '')
-            globalVars[name.replace('.', '_')] = "'%s'" % local_file.split('/')[-1]
+            local_file = resource_to_dir(local_src, file_type=extension)
+        else:
+            # In case is not found on traverse we dump it from request to file
+            response = subrequest(portal.absolute_url() + '/' + css)
+            local_file = None
+            if response.status == 200:
+                css_body = response.getBody()
+                file_name = uuid.uuid4().hex
+                try:
+                    os.mkdir(temp_resource_folder)
+                except OSError:
+                    pass
+                local_file = temp_resource_folder + '/' + file_name + '.js'
+                temp_file = open(local_file, 'w')
+                temp_file.write(css_body.encode('utf-8'))
+                temp_file.close()
+
+        if local_file:
+            less_directories[css.rsplit('/', 1)[0]] = local_file.rsplit('/', 1)[0].replace(os.getcwd() + '/', '')  # noqa
+            # local_file = local_file.replace(os.getcwd(), '')
+            # relative = ''
+            # for i in range(len(local_file.split('/'))):
+            #     relative += '../'
+            # globalVars[name.replace('.', '_')] = "'%s'" % local_file  # noqa
+            globalVars[name.replace('.', '_')] = "'%s'" % local_file.split('/')[-1]  # noqa
             if '/'.join(local_file.split('/')[:-1]) not in less_paths:
                 less_paths.append('/'.join(local_file.split('/')[:-1]))
         else:
@@ -216,6 +292,7 @@ for g, src in globalVars.items():
 # BUNDLE LOOP
 
 require_configs = ""
+uglify_configs = ""
 less_files = ""
 less_final_config = ""
 sed_config_final = ""
@@ -231,16 +308,26 @@ for bkey, bundle in bundles.items():
                     main_js_path = resource_to_dir(js_object)
                     target_dir = '/'.join(bundle.jscompilation.split('/')[:-1])
                     target_name = bundle.jscompilation.split('/')[-1]
-                    target_path = resource_to_dir(portal.unrestrictedTraverse(target_dir))
+                    if '.min.js' in target_name:
+                        # minified version in new resource registry
+                        target_name = target_name.rpartition('.min.js')[0]
+                    else:
+                        target_name = target_name.rpartition('.js')[0]
+                    target_path = resource_to_dir(portal.unrestrictedTraverse(target_dir))  # noqa
                     watch_files.append(main_js_path)
                     rc = requirejs_config.format(
                         bkey=resource,
                         paths=json.dumps(paths),
                         shims=json.dumps(shims),
                         name=main_js_path,
-                        out=target_path + '/' + target_name
+                        out=target_path + '/' + target_name + '.js'
                     )
                     require_configs += rc
+                    uc = uglify_config.format(
+                        bkey=resource,
+                        src=target_path + '/' + target_name  # noqa
+                    )
+                    uglify_configs += uc
 
             if res_obj.css:
                 for css_file in res_obj.css:
@@ -251,10 +338,10 @@ for bkey, bundle in bundles.items():
                         relative_paths = '../' * (elements - 1)
 
                         main_css_path = resource_to_dir(css)
-                        target_dir = '/'.join(bundle.csscompilation.split('/')[:-1])
+                        target_dir = '/'.join(bundle.csscompilation.split('/')[:-1])  # noqa
                         target_name = bundle.csscompilation.split('/')[-1]
-                        target_path = resource_to_dir(portal.unrestrictedTraverse(target_dir))
-                        less_file = "\"%s/%s\": \"%s\"," % (target_path, target_name, main_css_path)
+                        target_path = resource_to_dir(portal.unrestrictedTraverse(target_dir))  # noqa
+                        less_file = "\"%s/%s\": \"%s\"," % (target_path, target_name, main_css_path)  # noqa
                         less_files += less_file
                         watch_files.append(main_css_path)
                         # replace urls
@@ -266,6 +353,14 @@ for bkey, bundle in bundles.items():
                                 pattern=direc,
                                 destination=relative_paths + webpath)
                             sed_count += 1
+
+                        # replace the final missing paths
+                        sed_config_final += sed_config.format(
+                            path=target_path + '/' + target_name,
+                            name='sed' + str(sed_count),
+                            pattern=os.getcwd(),
+                            destination='')
+                        sed_count += 1
 
                     else:
                         print "No file found: " + script.js
@@ -281,6 +376,7 @@ gruntfile = open('Gruntfile.js', 'w')
 gruntfile.write(gruntfile_template.format(
     less=less_final_config,
     requirejs=require_configs,
+    uglify=uglify_configs,
     sed=sed_config_final,
     files=json.dumps(watch_files))
 )
